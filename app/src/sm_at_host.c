@@ -10,9 +10,8 @@
 #include "sm_util.h"
 #include "sm_ctrl_pin.h"
 #include "sm_at_dfu.h"
-#if defined(CONFIG_SM_PPP)
 #include "sm_ppp.h"
-#endif
+#include "sm_at_socket.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -46,7 +45,8 @@ LOG_MODULE_REGISTER(sm_at_host, CONFIG_SM_LOG_LEVEL);
 enum sm_operation_mode {
 	SM_AT_COMMAND_MODE, /* AT command host or bridge */
 	SM_DATA_MODE,       /* Raw data sending */
-	SM_NULL_MODE        /* Discard incoming until next command */
+	SM_NULL_MODE,       /* Discard incoming until next command */
+	SM_INVALID_MODE     /* Invalid mode, used for error handling */
 };
 
 enum sm_debug_print {
@@ -71,6 +71,8 @@ static void at_pipe_event_handler(struct modem_pipe *pipe, enum modem_pipe_event
 				  void *user_data);
 static size_t sm_at_receive(struct sm_at_host_ctx *ctx, uint8_t c);
 static void sm_at_host_work_fn(struct k_work *work);
+static enum sm_operation_mode get_sm_mode(struct sm_at_host_ctx *ctx);
+static bool sm_at_ctx_check(struct sm_at_host_ctx *ctx);
 
 /**
  * @brief AT host context structure.
@@ -146,10 +148,15 @@ struct sm_at_host_ctx {
 	} echo_ctx;
 
 	/* Event callback mechanism */
+	/* TODO: combine event work and idle_work_list */
 	struct {
 		sys_slist_t event_cbs;
 		atomic_t events;
 	} event_ctx;
+	sys_slist_t idle_work_list;
+
+	/* Asynchronous poll context for sockets */
+	struct async_poll_ctx poll_ctx;
 };
 
 enum sm_pipe_event {
@@ -172,7 +179,7 @@ RING_BUF_DECLARE(urc_buf, CONFIG_SM_URC_BUFFER_SIZE);
 uint8_t sm_response_buf[CONFIG_SM_AT_BUF_SIZE + 1];
 /* Current executing context (set by entry points) */
 static struct sm_at_host_ctx *current_ctx;
-
+static struct k_spinlock sm_at_host_lock;
 uint16_t sm_datamode_time_limit;
 
 /**
@@ -293,12 +300,14 @@ struct sm_at_host_ctx *sm_at_host_get_ctx_from(struct modem_pipe *pipe)
 		return NULL;
 	}
 
-	SYS_SLIST_FOR_EACH_CONTAINER(&instance_list, ctx, node) {
-		if (atomic_ptr_get(&ctx->pipe) == pipe) {
-			return ctx;
+	K_SPINLOCK(&sm_at_host_lock) {
+		SYS_SLIST_FOR_EACH_CONTAINER(&instance_list, ctx, node) {
+			if (atomic_ptr_get(&ctx->pipe) == pipe) {
+				break;
+			}
 		}
 	}
-	return NULL;
+	return ctx;
 }
 
 struct sm_at_host_ctx *sm_at_host_get_urc_ctx(void)
@@ -314,6 +323,13 @@ struct modem_pipe *sm_at_host_get_pipe(struct sm_at_host_ctx *ctx)
 	return ctx ? atomic_ptr_get(&ctx->pipe) : NULL;
 }
 
+struct async_poll_ctx *sm_at_host_get_async_poll_ctx(struct modem_pipe *pipe)
+{
+	struct sm_at_host_ctx *ctx = sm_at_host_get_ctx_from(pipe);
+
+	return sm_at_ctx_check(ctx) ? &ctx->poll_ctx : NULL;
+}
+
 /**
  * @brief Check if ctx pointer is still valid.
  *
@@ -324,17 +340,21 @@ struct modem_pipe *sm_at_host_get_pipe(struct sm_at_host_ctx *ctx)
 static bool sm_at_ctx_check(struct sm_at_host_ctx *ctx)
 {
 	struct sm_at_host_ctx *p;
+	bool found = false;
 
 	if (!ctx) {
 		return false;
 	}
 
-	SYS_SLIST_FOR_EACH_CONTAINER(&instance_list, p, node) {
-		if (p == ctx) {
-			return true;
+	K_SPINLOCK(&sm_at_host_lock) {
+		SYS_SLIST_FOR_EACH_CONTAINER(&instance_list, p, node) {
+			if (p == ctx) {
+				found = true;
+				break;
+			}
 		}
 	}
-	return false;
+	return found;
 }
 
 /* Process received data from pipe */
@@ -372,6 +392,12 @@ static void at_pipe_rx_work_fn(struct k_work *work)
 			sm_at_receive(ctx, rx_buf);
 		}
 	} while (ret > 0 && atomic_ptr_get(&ctx->pipe) == pipe);
+
+	/* Allow idle work to run immediately, don't need to wait for timer */
+	if (atomic_ptr_get(&ctx->pipe) == pipe && ctx->at_cmd_len == 0 &&
+	    get_sm_mode(ctx) == SM_AT_COMMAND_MODE) {
+		event_work_fn(ctx);
+	}
 
 	/* Clear current context */
 	sm_at_host_set_current_ctx(NULL);
@@ -521,6 +547,9 @@ void sm_at_host_attach(struct modem_pipe *pipe)
 
 static enum sm_operation_mode get_sm_mode(struct sm_at_host_ctx *ctx)
 {
+	if (!ctx || !sm_at_ctx_check(ctx)) {
+		return SM_INVALID_MODE;
+	}
 	return ctx->at_mode;
 }
 
@@ -969,7 +998,7 @@ static int sm_at_send_internal(struct sm_at_host_ctx *ctx, const uint8_t *data, 
 		if (ret < len) {
 			LOG_ERR("URC buffer full, dropped %d bytes", len - ret);
 		}
-		if (ctx->at_cmd_len > 0) {
+		if (!in_idle(ctx)) {
 			LOG_DBG("AT command in progress, delaying URC processing");
 			k_timer_start(&ctx->echo_ctx.timer, URC_RETRY_DELAY, K_NO_WAIT);
 		} else {
@@ -1324,6 +1353,8 @@ static size_t sm_at_receive(struct sm_at_host_ctx *ctx, uint8_t c)
 	case SM_NULL_MODE:
 		ret = null_handler(ctx, c);
 		break;
+	default:
+		break;
 	}
 
 	/* start inactivity timer in datamode */
@@ -1446,18 +1477,40 @@ int enter_datamode(sm_datamode_handler_t handler, size_t data_len)
 	return 0;
 }
 
-bool in_datamode(void)
+bool in_datamode_ctx(struct sm_at_host_ctx *ctx)
 {
-	struct sm_at_host_ctx *ctx = sm_at_host_get_current();
-
 	return (get_sm_mode(ctx) == SM_DATA_MODE);
 }
 
-bool in_at_mode(void)
+bool in_datamode_pipe(struct modem_pipe *pipe)
 {
-	struct sm_at_host_ctx *ctx = sm_at_host_get_current();
+	struct sm_at_host_ctx *ctx = sm_at_host_get_ctx_from(pipe);
 
+	return in_datamode_ctx(ctx);
+}
+
+bool in_at_mode_ctx(struct sm_at_host_ctx *ctx)
+{
 	return (get_sm_mode(ctx) == SM_AT_COMMAND_MODE);
+}
+
+bool in_at_mode_pipe(struct modem_pipe *pipe)
+{
+	struct sm_at_host_ctx *ctx = sm_at_host_get_ctx_from(pipe);
+
+	return in_at_mode_ctx(ctx);
+}
+
+bool in_idle_ctx(struct sm_at_host_ctx *ctx)
+{
+	return (in_at_mode_ctx(ctx) && ctx->at_cmd_len == 0);
+}
+
+bool in_idle_pipe(struct modem_pipe *pipe)
+{
+	struct sm_at_host_ctx *ctx = sm_at_host_get_ctx_from(pipe);
+
+	return in_idle_ctx(ctx);
 }
 
 void exit_datamode_handler(int result)
@@ -1592,13 +1645,6 @@ void sm_at_host_echo(bool enable)
 	k_timer_stop(&ctx->echo_ctx.timer);
 }
 
-bool sm_at_host_echo_urc_delay(void)
-{
-	struct sm_at_host_ctx *ctx = sm_at_host_get_current();
-
-	return k_timer_remaining_get(&ctx->echo_ctx.timer) > 0;
-}
-
 static void echo_timer_handler(struct k_timer *timer)
 {
 	struct sm_at_host_ctx *ctx = CONTAINER_OF(timer, struct sm_at_host_ctx, echo_ctx.timer);
@@ -1643,6 +1689,19 @@ static void event_work_fn(struct sm_at_host_ctx *ctx)
 		}
 	}
 
+	do {
+		K_SPINLOCK(&sm_at_host_lock) {
+			node = sys_slist_get(&ctx->idle_work_list);
+		}
+		if (!node) {
+			break;
+		}
+		struct k_work *work = CONTAINER_OF(node, struct k_work, node);
+
+		/* Don't submit, just run directly, because we are already in right context */
+		work->handler(work);
+	} while (true);
+
 	/* Clear current context */
 	sm_at_host_set_current_ctx(NULL);
 }
@@ -1679,8 +1738,10 @@ static int sm_at_host_ctx_init(struct sm_at_host_ctx *ctx, struct modem_pipe *pi
 	/* Initialize work items and timers */
 	k_work_init(&ctx->raw_send_scheduled_work, raw_send_scheduled);
 	k_work_init(&ctx->rx_work, at_pipe_rx_work_fn);
+	k_work_init(&ctx->poll_ctx.poll_work, sm_at_socket_poll_work_handler);
 	k_timer_init(&ctx->inactivity_timer, inactivity_timer_handler, NULL);
 	k_timer_init(&ctx->echo_ctx.timer, echo_timer_handler, NULL);
+	sys_slist_init(&ctx->idle_work_list);
 
 	/* Initialize event context */
 	sys_slist_init(&ctx->event_ctx.event_cbs);
@@ -1724,7 +1785,9 @@ static struct sm_at_host_ctx *sm_at_host_create(struct modem_pipe *pipe)
 	}
 
 	/* Add to instance list */
-	sys_slist_append(&instance_list, &ctx->node);
+	K_SPINLOCK(&sm_at_host_lock) {
+		sys_slist_append(&instance_list, &ctx->node);
+	}
 
 	modem_pipe_attach(pipe, at_pipe_event_handler, ctx);
 
@@ -1813,7 +1876,7 @@ static void sm_at_host_work_fn(struct k_work *work)
 		switch (msg.sm_event) {
 		case SM_EVENT_URC:
 			/* Don't interrupt AT command execution */
-			if (msg.ctx->at_cmd_len == 0) {
+			if (in_idle(msg.ctx)) {
 				while (!ring_buf_is_empty(&urc_buf)) {
 					uint8_t *p;
 					size_t len = ring_buf_get_claim(&urc_buf, &p, UINT16_MAX);
@@ -1831,7 +1894,7 @@ static void sm_at_host_work_fn(struct k_work *work)
 			}
 			break;
 		case SM_EVENT_AT_MODE:
-			if (msg.ctx->at_cmd_len == 0) {
+			if (in_idle(msg.ctx)) {
 				event_work_fn(msg.ctx);
 			} else {
 				k_timer_start(&msg.ctx->echo_ctx.timer, URC_RETRY_DELAY, K_NO_WAIT);
@@ -1840,6 +1903,35 @@ static void sm_at_host_work_fn(struct k_work *work)
 		default:
 			break;
 		}
+	}
+}
+
+void sm_at_host_queue_idle_work(struct modem_pipe *pipe, struct k_work *work)
+{
+	struct sm_at_host_ctx *ctx = sm_at_host_get_ctx_from(pipe);
+
+	if (!ctx) {
+		LOG_ERR("No AT host context found for pipe %p", (void *)pipe);
+		return;
+	}
+	/*
+	 * TODO: A serious race condition exists where a work item
+	 * might have already been added to a idle_work_list of another socket
+	 * context. This is because sm_at_socket.c uses a single async_poll_ctx but
+	 * multiple sockets. So maybe the poll_ctx should be moved into sm_at_host_ctx?
+	 */
+	if (k_work_is_pending(work)) {
+		LOG_ERR("Work %p is already pending, cannot queue", (void *)work);
+		return;
+	}
+
+	K_SPINLOCK(&sm_at_host_lock) {
+		if (!sys_slist_find(&ctx->idle_work_list, &work->node, &(sys_snode_t *){0})) {
+			sys_slist_append(&ctx->idle_work_list, &work->node);
+		}
+	}
+	if (in_idle(ctx)) {
+		sm_at_host_event_notify(ctx, SM_EVENT_URC);
 	}
 }
 
@@ -1875,7 +1967,9 @@ static int sm_at_host_destroy(struct sm_at_host_ctx *ctx)
 	k_work_cancel_sync(&ctx->raw_send_scheduled_work, &sync);
 
 	/* Remove from instance list */
-	sys_slist_find_and_remove(&instance_list, &ctx->node);
+	K_SPINLOCK(&sm_at_host_lock) {
+		sys_slist_find_and_remove(&instance_list, &ctx->node);
+	}
 
 	LOG_INF("Destroyed AT host instance %p", (void *)ctx);
 
