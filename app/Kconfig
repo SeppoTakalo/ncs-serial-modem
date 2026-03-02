@@ -250,6 +250,15 @@ config SM_NRF_CLOUD
 	default y
 	select EXPERIMENTAL
 
+if SM_NRF_CLOUD
+config HEAP_MEM_POOL_ADD_SIZE_SM_NRF_CLOUD
+	int "Additional heap memory pool size for nRF Cloud support"
+	default 8192
+	help
+	  Some libraries used by nRF Cloud use System Heap (k_malloc() / k_free()) for
+	  dynamic memory allocation.
+endif # SM_NRF_CLOUD
+
 config SM_MQTTC
 	bool "MQTT client support"
 	default y
@@ -297,15 +306,6 @@ config SM_MODEM_PIPE_TIMEOUT
 	default 10
 
 endif # SM_CMUX || SM_PPP
-
-config HEAP_MEM_POOL_ADD_SIZE_SM_AT
-	int "Additional heap memory pool size for AT Host"
-	default 16384 if SM_CMUX
-	default 8192
-	help
-	  Additional heap memory pool size required for AT Host.
-	  This value is added to the total heap memory pool size defined in
-	  CONFIG_HEAP_MEM_POOL_SIZE.
 
 if SM_MQTTC
 

@@ -534,7 +534,7 @@ static bool set_sm_mode(struct sm_at_host_ctx *ctx, enum sm_operation_mode mode)
 			if (ctx->data_rb_buf == NULL) {
 				LOG_DBG("Allocating datamode buffer of size %d",
 					CONFIG_SM_DATAMODE_BUF_SIZE);
-				ctx->data_rb_buf = k_malloc(CONFIG_SM_DATAMODE_BUF_SIZE);
+				ctx->data_rb_buf = malloc(CONFIG_SM_DATAMODE_BUF_SIZE);
 				if (ctx->data_rb_buf == NULL) {
 					LOG_ERR("Failed to allocate datamode buffer");
 					return false;
@@ -1129,7 +1129,7 @@ static size_t cmd_rx_handler(struct sm_at_host_ctx *ctx, uint8_t c)
 			rsp_send_error();
 			goto cmd_finnish_or_fail;
 		}
-		uint8_t *new_buf = k_realloc(ctx->at_buf, new_size);
+		uint8_t *new_buf = realloc(ctx->at_buf, new_size);
 
 		if (!new_buf) {
 			LOG_ERR("Failed to expand AT command buffer");
@@ -1262,7 +1262,7 @@ cmd_finnish_or_fail:
 		ctx->echo_len = 0;
 		/* Release extra AT buffer */
 		if (ctx->at_buf_size > AT_BUF_MIN_SIZE) {
-			uint8_t *new_buf = k_realloc(ctx->at_buf, AT_BUF_MIN_SIZE);
+			uint8_t *new_buf = realloc(ctx->at_buf, AT_BUF_MIN_SIZE);
 
 			if (new_buf) {
 				ctx->at_buf = new_buf;
@@ -1661,7 +1661,7 @@ static int sm_at_host_ctx_init(struct sm_at_host_ctx *ctx, struct modem_pipe *pi
 	/* Initialize context structure */
 	memset(ctx, 0, sizeof(*ctx));
 
-	ctx->at_buf = k_malloc(AT_BUF_MIN_SIZE);
+	ctx->at_buf = malloc(AT_BUF_MIN_SIZE);
 	if (!ctx->at_buf) {
 		LOG_ERR("Failed to allocate AT command buffer");
 		return -ENOMEM;
@@ -1710,7 +1710,7 @@ static struct sm_at_host_ctx *sm_at_host_create(struct modem_pipe *pipe)
 	}
 
 	/* Allocate new instance from heap */
-	ctx = k_malloc(sizeof(*ctx));
+	ctx = malloc(sizeof(*ctx));
 	if (!ctx) {
 		LOG_ERR("Failed to allocate AT host context");
 		return NULL;
@@ -1719,7 +1719,7 @@ static struct sm_at_host_ctx *sm_at_host_create(struct modem_pipe *pipe)
 	/* Initialize the context */
 	err = sm_at_host_ctx_init(ctx, pipe);
 	if (err) {
-		k_free(ctx);
+		free(ctx);
 		return NULL;
 	}
 
@@ -1877,12 +1877,13 @@ static int sm_at_host_destroy(struct sm_at_host_ctx *ctx)
 	/* Remove from instance list */
 	sys_slist_find_and_remove(&instance_list, &ctx->node);
 
-	/* Free the context */
-	k_free(ctx->data_rb_buf);
-	k_free(ctx->at_buf);
-	k_free(ctx);
-
 	LOG_INF("Destroyed AT host instance %p", (void *)ctx);
+
+	/* Free the context */
+	free(ctx->data_rb_buf);
+	free(ctx->at_buf);
+	free(ctx);
+
 	return 0;
 }
 
