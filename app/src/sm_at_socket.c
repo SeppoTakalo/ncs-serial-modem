@@ -247,7 +247,7 @@ static void auto_reception(struct sm_socket *sock)
 		LOG_ERR("auto_reception() error: %d", err);
 		return;
 	}
-	if (!in_datamode(sock->pipe)) {
+	if (!in_datamode(sm_at_host_get_current())) {
 		/* <CR><LF> after the data. */
 		sm_at_send_str("\r\n");
 	}
@@ -442,12 +442,8 @@ static void send_cb(const struct nrf_modem_sendcb_params *params)
 	sock->send_ntf.bytes_sent = params->bytes_sent;
 	atomic_set(&sock->send_ntf.ready, 1);
 
-	if (sock->pipe) {
-		/* Schedule work to execute in AT context */
-		sm_at_host_queue_idle_work(sock->pipe, &work);
-	} else {
-		k_work_submit_to_queue(&sm_work_q, &work);
-	}
+	/* Schedule work to execute in AT context */
+	sm_at_host_queue_idle_work(sock->pipe, &work);
 }
 
 static int set_so_send_cb(struct sm_socket *socket)
@@ -1035,7 +1031,7 @@ static int do_send(struct sm_socket *sock, const uint8_t *data, int len, int fla
 		sent += ret;
 	}
 
-	if (!in_datamode(sock->pipe)) {
+	if (!in_datamode(sm_at_host_get_current())) {
 		rsp_send("\r\n#XSEND: %d,%d,%d\r\n", sock->fd,
 			 send_ntf ? AT_SOCKET_SEND_RESULT_NW_ACK_URC
 				  : AT_SOCKET_SEND_RESULT_DEFAULT,
@@ -1099,7 +1095,7 @@ static int do_recv(struct sm_socket *sock, int timeout, int flags,
 	if (ret == 0) {
 		LOG_WRN("nrf_recv() return 0");
 	} else {
-		if (!in_datamode(sock->pipe)) {
+		if (!in_datamode(sm_at_host_get_current())) {
 			rsp_send("\r\n#XRECV: %d,%d,%d\r\n", sock->fd, mode, ret);
 		}
 
@@ -1171,7 +1167,7 @@ static int do_sendto(struct sm_socket *sock, const char *url, uint16_t port, con
 		LOG_ERR("Sent %u out of %u bytes. (%d)", sent, len, ret);
 	}
 
-	if (!in_datamode(sock->pipe)) {
+	if (!in_datamode(sm_at_host_get_current())) {
 		rsp_send("\r\n#XSENDTO: %d,%d,%d\r\n", sock->fd,
 			 send_ntf ? AT_SOCKET_SEND_RESULT_NW_ACK_URC
 				  : AT_SOCKET_SEND_RESULT_DEFAULT,
@@ -1211,7 +1207,7 @@ static int do_recvfrom(struct sm_socket *sock, int timeout, int flags,
 	if (ret == 0) {
 		LOG_WRN("nrf_recvfrom() return 0");
 	} else {
-		if (!in_datamode(sock->pipe)) {
+		if (!in_datamode(sm_at_host_get_current())) {
 			char peer_addr[NRF_INET6_ADDRSTRLEN] = {0};
 			uint16_t peer_port = 0;
 
