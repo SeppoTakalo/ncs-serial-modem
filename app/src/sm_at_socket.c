@@ -1593,7 +1593,7 @@ STATIC int handle_at_secure_socketopt(enum at_parser_cmd_type cmd_type,
 		if (op == AT_SOCKETOPT_SET) {
 			int value_int = 0;
 			char value_str[SM_MAX_URL] = {0};
-			int size = SM_MAX_URL;
+			size_t size = SM_MAX_URL;
 
 			err = at_parser_num_get(parser, 4, &value_int);
 			if (err == -EOPNOTSUPP) {
@@ -1666,7 +1666,7 @@ STATIC int handle_at_connect(enum at_parser_cmd_type cmd_type, struct at_parser 
 	int err = -EINVAL;
 	int fd;
 	char url[SM_MAX_URL] = {0};
-	int size = SM_MAX_URL;
+	size_t size = SM_MAX_URL;
 	uint16_t port;
 	struct sm_socket *sock = NULL;
 
@@ -1995,7 +1995,7 @@ STATIC int handle_at_getaddrinfo(enum at_parser_cmd_type cmd_type, struct at_par
 	int err = -EINVAL;
 	char hostname[NI_MAXHOST];
 	char host[SM_MAX_URL];
-	int size = SM_MAX_URL;
+	size_t size = SM_MAX_URL;
 	struct nrf_addrinfo *result;
 	struct nrf_addrinfo *res;
 	char rsp_buf[256];
