@@ -87,6 +87,7 @@ struct http_request {
 	bool need_rearm_pollin;    /* Flag for socket layer to re-arm POLLIN */
 	int64_t timeout_timestamp; /* Idle timeout (resets on each data reception) */
 	bool owns_socket;          /* Whether this request owns the socket */
+	struct modem_pipe *pipe;
 };
 
 static struct http_request http_requests[HTTP_MAX_REQUESTS];
@@ -128,6 +129,7 @@ static struct http_request *alloc_request(void)
 			http_requests[i].state = HTTP_STATE_IDLE;
 			http_requests[i].content_length = -1;
 			http_requests[i].owns_socket = false;
+			http_requests[i].pipe = sm_at_host_get_current_pipe();
 			k_mutex_unlock(&http_mutex);
 			return &http_requests[i];
 		}
@@ -399,26 +401,26 @@ static void http_close_request(struct http_request *req)
 }
 
 /* Send error URC */
-static void http_send_error(int handle, int error_code)
+static void http_send_error(struct http_request *req, int error_code)
 {
-	rsp_send("\r\n#XHTTPCERR: %d,%d\r\n", handle, error_code);
+	rsp_send_to(req->pipe, "\r\n#XHTTPCERR: %d,%d\r\n", req->handle, error_code);
 }
 
 /* Send status URC */
-static void http_send_status(int handle, int status_code, int total_bytes)
+static void http_send_status(struct http_request *req, int status_code, int total_bytes)
 {
-	rsp_send("\r\n#XHTTPCSTAT: %d,%d,%d\r\n", handle, status_code, total_bytes);
+	rsp_send_to(req->pipe, "\r\n#XHTTPCSTAT: %d,%d,%d\r\n", req->handle, status_code, total_bytes);
 }
 
 /* Send data URC */
-static void http_send_data(int handle, const uint8_t *data, int len)
+static void http_send_data(struct http_request *req, const uint8_t *data, int len)
 {
 	if (len <= 0) {
 		return;
 	}
 
-	rsp_send("\r\n#XHTTPCDATA: %d,%d\r\n", handle, len);
-	data_send(data, len);
+	rsp_send_to(req->pipe, "\r\n#XHTTPCDATA: %d,%d\r\n", req->handle, len);
+	data_send(req->pipe, data, len);
 }
 
 /* Parse HTTP status code from response buffer */
@@ -482,7 +484,7 @@ static void http_process_request(struct http_request *req, uint8_t events)
 	/* Check for idle timeout (no activity for HTTP_RESPONSE_TIMEOUT_MS) */
 	if (k_uptime_get() > req->timeout_timestamp) {
 		LOG_ERR("HTTP request %d timed out in state %d", req->handle, req->state);
-		http_send_error(req->handle, -ETIMEDOUT);
+		http_send_error(req, -ETIMEDOUT);
 		http_close_request(req);
 		return;
 	}
@@ -490,7 +492,7 @@ static void http_process_request(struct http_request *req, uint8_t events)
 	/* Handle critical error conditions (but not POLLHUP - it's normal for Connection: close) */
 	if (events & (NRF_POLLERR | NRF_POLLNVAL)) {
 		LOG_ERR("HTTP %d: Socket error (events=0x%x)", req->handle, events);
-		http_send_error(req->handle, -ECONNRESET);
+		http_send_error(req, -ECONNRESET);
 		http_close_request(req);
 		return;
 	}
@@ -500,7 +502,7 @@ static void http_process_request(struct http_request *req, uint8_t events)
 	    (req->state == HTTP_STATE_SENDING_REQUEST || req->state == HTTP_STATE_SENDING_BODY)) {
 		LOG_ERR("HTTP %d: Connection closed during send (events=0x%x)", req->handle,
 			events);
-		http_send_error(req->handle, -ECONNRESET);
+		http_send_error(req, -ECONNRESET);
 		http_close_request(req);
 		return;
 	}
@@ -523,7 +525,7 @@ static void http_process_request(struct http_request *req, uint8_t events)
 					return;
 				}
 				LOG_ERR("Send failed: %d", errno);
-				http_send_error(req->handle, -errno);
+				http_send_error(req, -errno);
 				http_close_request(req);
 				return;
 			}
@@ -589,12 +591,12 @@ static void http_process_request(struct http_request *req, uint8_t events)
 					return;
 				}
 				LOG_ERR("Recv failed: %d", errno);
-				http_send_error(req->handle, -errno);
+				http_send_error(req, -errno);
 				http_close_request(req);
 				return;
 			} else if (ret == ETIMEDOUT) {
 				LOG_ERR("Recv timed out");
-				http_send_error(req->handle, -ETIMEDOUT);
+				http_send_error(req, -ETIMEDOUT);
 				http_close_request(req);
 				return;
 			}
@@ -612,7 +614,7 @@ static void http_process_request(struct http_request *req, uint8_t events)
 						req->content_length);
 				}
 
-				http_send_status(req->handle, req->status_code,
+				http_send_status(req, req->status_code,
 						 req->total_received);
 				http_close_request(req);
 				return;
@@ -655,7 +657,7 @@ static void http_process_request(struct http_request *req, uint8_t events)
 					int body_len = req->recv_buf_len - body_offset;
 
 					if (body_len > 0) {
-						http_send_data(req->handle,
+						http_send_data(req,
 							       req->recv_buf + body_offset,
 							       body_len);
 					}
@@ -668,13 +670,13 @@ static void http_process_request(struct http_request *req, uint8_t events)
 				/* Check if buffer is full */
 				if (req->recv_buf_len >= sizeof(req->recv_buf) - 1) {
 					LOG_ERR("HTTP headers too large");
-					http_send_error(req->handle, -ENOMEM);
+					http_send_error(req, -ENOMEM);
 					http_close_request(req);
 					return;
 				}
 			} else {
 				/* Receiving body - send data immediately */
-				http_send_data(req->handle, req->recv_buf, req->recv_buf_len);
+				http_send_data(req, req->recv_buf, req->recv_buf_len);
 				req->recv_buf_len = 0;
 			}
 
@@ -702,7 +704,7 @@ static void http_process_request(struct http_request *req, uint8_t events)
 				req->recv_buf[ret] = '\0';
 				req->total_received += ret;
 				req->timeout_timestamp = k_uptime_get() + HTTP_RESPONSE_TIMEOUT_MS;
-				http_send_data(req->handle, req->recv_buf, ret);
+				http_send_data(req, req->recv_buf, ret);
 				LOG_DBG("HTTP %d: Drained %d bytes on POLLHUP", req->handle, ret);
 			}
 
@@ -717,11 +719,11 @@ static void http_process_request(struct http_request *req, uint8_t events)
 						req->content_length);
 				}
 
-				http_send_status(req->handle, req->status_code,
+				http_send_status(req, req->status_code,
 						 req->total_received);
 			} else {
 				/* Closed before receiving complete headers */
-				http_send_error(req->handle, -ECONNRESET);
+				http_send_error(req, -ECONNRESET);
 			}
 			http_close_request(req);
 			return;
@@ -1028,7 +1030,7 @@ STATIC int handle_at_httpccon(enum at_parser_cmd_type cmd_type, struct at_parser
 
 				if (req) {
 					LOG_INF("Cancelling HTTP request %d", handle);
-					http_send_error(handle, -ECANCELED);
+					http_send_error(req, -ECANCELED);
 					http_close_request(req);
 				} else {
 					LOG_ERR("Failed to find request for handle: %d", handle);
