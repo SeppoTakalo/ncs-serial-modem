@@ -51,6 +51,26 @@ config SM_CR_LF_TERMINATION
 
 endchoice
 
+choice
+	prompt "URC handling when CMUX is active"
+	default SM_URC_FIRST_CHANNEL
+	help
+	  Sets the default behavior for handling URCs messages when CMUX is active.
+	  When URC messages arrive from modem, if there are multiple channels in AT command mode,
+	  the URCs will be sent according to the selected option.
+
+	  Available options are:
+	  - URCs are sent on the first CMUX channel
+	  - URCs are sent on all CMUX channels
+
+config SM_URC_FIRST_CHANNEL
+	bool "Send URCs on the first CMUX channel"
+
+config SM_URC_ALL_CHANNELS
+	bool "Send URCs on all CMUX channels"
+
+endchoice
+
 #
 # UART buffers (when CMUX is not in use)
 #

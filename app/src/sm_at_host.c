@@ -62,6 +62,11 @@ enum sm_debug_print {
 	SM_DEBUG_PRINT_FULL
 };
 
+enum sm_urc_mode {
+	SM_URC_FIRST_CHANNEL,
+	SM_URC_ALL_CHANNELS,
+} sm_urc_mode = IS_ENABLED(SM_URC_ALL_CHANNELS) ? SM_URC_ALL_CHANNELS : SM_URC_FIRST_CHANNEL;
+
 struct data_mode {
 	sm_datamode_handler_t handler;
 	int handler_result;
@@ -1808,14 +1813,25 @@ static void send_urcs(void)
 		uint8_t *p;
 		size_t len = ring_buf_get_claim(&urc_buf, &p, UINT16_MAX);
 
-		SYS_SLIST_FOR_EACH_CONTAINER(&instance_list, ctx, node) {
-			if (!is_open(ctx) || !in_at_mode(ctx)) {
-				continue;
-			}
-			int send = sm_at_host_pipe_tx_blocking(ctx, p, len);
+		if (sm_urc_mode == SM_URC_ALL_CHANNELS) {
+			SYS_SLIST_FOR_EACH_CONTAINER(&instance_list, ctx, node) {
+				if (!is_open(ctx) || !in_at_mode(ctx)) {
+					continue;
+				}
+				int send = sm_at_host_pipe_tx_blocking(ctx, p, len);
 
-			if (send < len) {
-				LOG_ERR("Failed to send URC: %d (ctx %p)", send, ctx);
+				if (send < len) {
+					LOG_ERR("Failed to send URC: %d (ctx %p)", send, ctx);
+				}
+			}
+		} else {
+			ctx = sm_at_host_get_urc_ctx();
+			if (ctx && is_idle(ctx)) {
+				int send = sm_at_host_pipe_tx_blocking(ctx, p, len);
+
+				if (send < len) {
+					LOG_ERR("Failed to send URC: %d (ctx %p)", send, ctx);
+				}
 			}
 		}
 		ring_buf_get_finish(&urc_buf, len);
@@ -2055,5 +2071,34 @@ STATIC int handle_at_datactrl(enum at_parser_cmd_type cmd_type, struct at_parser
 		break;
 	}
 
+	return ret;
+}
+
+SM_AT_CMD_CUSTOM(xurcmode, "AT#XURCMODE", handle_at_urcmode);
+STATIC int handle_at_urcmode(enum at_parser_cmd_type cmd_type, struct at_parser *parser, uint32_t)
+{	int ret = 0;
+	uint16_t mode;
+
+	switch (cmd_type) {
+	case AT_PARSER_CMD_TYPE_SET:
+		ret = at_parser_num_get(parser, 1, &mode);
+		if (ret) {
+			return ret;
+		}
+		if (mode > SM_URC_ALL_CHANNELS) {
+			LOG_ERR("Invalid URC mode: %d", mode);
+			return -EINVAL;
+		}
+		sm_urc_mode = mode;
+		break;
+	case AT_PARSER_CMD_TYPE_READ:
+		rsp_send("\r\n#XURCMODE: %d\r\n", sm_urc_mode);
+		break;
+	case AT_PARSER_CMD_TYPE_TEST:
+		rsp_send("\r\n#XURCMODE=<mode>\r\n");
+		break;
+	default:
+		break;
+	}
 	return ret;
 }
